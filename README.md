@@ -54,6 +54,10 @@ python3 dfu_flash.py firmware.bin
 
 - Tested on WeAct BlackPill STM32F411CEU6 with macOS (Apple Silicon). Should work also for F401 (same sector layout, the script handles up to 512 KB).
 - Starting address is always `0x08000000`.
+- If it stops in the middle, just run it again: it continue from the last good block, no erase again.
+- Some blocks fail every time with 64 bytes (some byte patterns don't like the bad USB clock). Script is then writing them in 16, 8 or 4 byte pieces, you will see a message for this.
+- When the link is stuck, the script is doing a USB reset by itself (same like unplug and plug again).
+- Also tested on HW-853 clone BlackPill (F411).
 - If it is still failing a lot, try warming the main chip a little bit (finger or hair dryer), the HSI is changing with temperature.
 - Other ways that always work: ST-Link (SWD), or the serial bootloader on A9/A10 with a USB-TTL adapter.
 

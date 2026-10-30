@@ -13,7 +13,9 @@ off-spec internal oscillator, so the USB clock is slightly wrong. Short requests
     half-received buffer into flash), then retries that block (up to 20 times), re-opening the device if needed,
   - works sector by sector: a sector that already holds the image is skipped (so a run that stopped part-way just
     continues); otherwise erase, write, read every block straight back, and redo the sector if a block came back
-    wrong, then reads the whole image back once more and starts the code.
+    wrong, then reads the whole image back once more and starts the code,
+  - a run that stopped part-way continues from the last good block (no new erase), a block that keeps failing is
+    written in 16-, 8-, 4-byte pieces, and a stuck link gets a USB reset (like re-plugging the cable).
 Uses libusb through ctypes, no Python packages needed.
 """
 import ctypes as C, ctypes.util, os, sys, time
@@ -35,6 +37,7 @@ LIB = load_libusb()
 LIB.libusb_open_device_with_vid_pid.restype = C.c_void_p
 LIB.libusb_open_device_with_vid_pid.argtypes = [C.c_void_p, C.c_uint16, C.c_uint16]
 LIB.libusb_control_transfer.argtypes = [C.c_void_p, C.c_uint8, C.c_uint8, C.c_uint16, C.c_uint16, C.c_void_p, C.c_uint16, C.c_uint]
+LIB.libusb_reset_device.argtypes = [C.c_void_p]
 for f in ("libusb_claim_interface", "libusb_release_interface", "libusb_set_interface_alt_setting", "libusb_close"):
     getattr(LIB, f).argtypes = [C.c_void_p] + ([C.c_int] * (2 if f == "libusb_set_interface_alt_setting" else 1 if f != "libusb_close" else 0))
 
@@ -124,6 +127,15 @@ class Dfu:
                 time.sleep(0.2)
         self.open()                                                # device may have re-enumerated
 
+    def reset(self):
+        """USB port reset: the bootloader re-enumerates, like unplugging and replugging the cable."""
+        try:
+            LIB.libusb_reset_device(self.h)
+        except Exception:
+            pass
+        time.sleep(1.0)
+        self.open()
+
     def cmd(self, data):                                           # DfuSe special command (set address / erase)
         self.ctrl(True, DNLOAD, 0, data)
         self.wait_idle()
@@ -161,7 +173,33 @@ def retry(dfu, what, fn, tries=20):
             if t == tries:
                 raise SystemExit(f"{what}: gave up after {tries} tries ({e})")
             time.sleep(0.05 * t)
+            if t % 5 == 0:
+                dfu.reset()                                       # a stuck link: re-enumerate, then carry on
             dfu.recover()
+
+
+def write_split(dfu, a, blk):
+    """Write one block; if it keeps failing, write it in 16-, then 8-, then 4-byte pieces. On these boards some byte
+    patterns fail every time in a 64-byte transfer (USB bit stuffing with a slightly-off USB clock); shorter transfers
+    get through. Pieces already written are not touched again."""
+    done = 0
+    for size in (len(blk), 16, 8, 4):
+        while done < len(blk):
+            piece = blk[done:done + size]
+            for t in range(6):
+                try:
+                    dfu.write(a + done, piece)
+                    break
+                except UsbError:
+                    time.sleep(0.05 * (t + 1))
+                    dfu.recover()
+            else:
+                break                                              # this size keeps failing: try a smaller one
+            done += len(piece)
+        if done == len(blk):
+            return
+        print(f"\r  0x{a + done:08x}: {size}-byte writes keep failing, trying smaller pieces", flush=True)
+    raise SystemExit(f"write 0x{a + done:08x}: fails even in 4-byte pieces")
 
 
 def main():
@@ -187,15 +225,25 @@ def main():
     while off < len(image):
         size = SECTORS[k] * 1024
         part = image[off:off + size]
-        if read_back(off, len(part)) == part:
+        have = read_back(off, len(part))
+        if have == part:
             print(f"sector {k} (0x{BASE + off:08x}): already correct")
         else:
+            # a run that stopped part-way leaves the sector correct up to some block and erased (FF) after it:
+            # carry on from there without erasing, so every run adds to the last one
+            start = next(i for i in range(0, len(part), bs) if have[i:i + bs] != part[i:i + bs])
+            resume = all(b == 0xFF for b in have[start:])
+            if resume:
+                print(f"sector {k}: correct up to 0x{BASE + off + start:08x}, rest erased: continuing there")
             for attempt in range(1, 6):
-                retry(dfu, f"erase sector {k}", lambda: dfu.erase(BASE + off))
+                if not resume:
+                    retry(dfu, f"erase sector {k}", lambda: dfu.erase(BASE + off))
+                    start = 0
+                resume = False
                 bad = None
-                for o in range(off, off + len(part), bs):
+                for o in range(off + start, off + len(part), bs):
                     blk = image[o:o + bs]
-                    retry(dfu, f"write 0x{BASE + o:08x}", lambda: dfu.write(BASE + o, blk))
+                    write_split(dfu, BASE + o, blk)
                     if read_back(o, len(blk)) != blk:
                         bad = o
                         break
